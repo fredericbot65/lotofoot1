@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0a0a14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Loto Foot IA">
+  <title>Loto Foot IA</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon.png">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a14; font-family: Georgia, serif; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
+
+const STORAGE_KEY = "lotofoot_v2";
+const COMPETITION_KEY = "lotofoot_competition";
+
+const PRONOSOFT_URLS = {
+  7: "https://www.pronosoft.com/fr/lotosports/ecarts/loto-foot-7/",
+  8: "https://www.pronosoft.com/fr/lotosports/ecarts/loto-foot-8/",
+  12: "https://www.pronosoft.com/fr/lotosports/ecarts/loto-foot-12/",
+  15: "https://www.pronosoft.com/fr/lotosports/ecarts/loto-foot-15/",
+};
+
+const SYSTEM_PROMPT = `Tu es un expert du Loto Foot français. Tu analyses les grilles avec :
+
+1. MUSIQUE DE GRILLE (Pronosoft) : utilise les écarts courants et séries en cours par position. Un écart élevé sur N = nul qui tarde = le jouer. Une longue série de 1 = retournement possible.
+2. MUSIQUE INDIVIDUELLE des équipes : forme récente 1/N/2. Plus importante que le classement.
+3. SURPRISES SYSTÉMATIQUES : 2-3 résultats surprises par grille. Identifie les "faux favoris".
+4. CONTEXTE : coupe (rotation), derby (équilibre), relégables (N fréquent).
+
+Règles clés :
+- Grande équipe en mauvaise musique sur match de coupe = danger
+- Match "trop sûr" = candidat surprise
+- Distribution finale cohérente : jamais de grille avec 12+ fois le même signe
+
+Format JSON OBLIGATOIRE (sans markdown) :
+{
+  "matches": [
+    {
+      "match": "Équipe A vs Équipe B",
+      "prediction": "1",
+      "confidence": 75,
+      "double": false,
+      "triple": false,
+      "risk": "faible|moyen|élevé",
+      "reason": "max 15 mots musique incluse"
+    }
+  ],
+  "distribution": {"1": 5, "N": 4, "2": 6},
+  "surprises_potentielles": ["match X car...", "match Y car..."],
+  "conseil_global": "conseil court incluant musique de grille"
+}`;
+
+function load(key, def) {
+  try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(def)); }
+  catch { return def; }
+}
+function save(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+
+const PC = { "1": "#4ade80", "N": "#facc15", "2": "#60a5fa" };
+const RC = { "faible": "#4ade80", "moyen": "#facc15", "élevé": "#f87171" };
+
+function App() {
+  const [screen, setScreen] = useState("home");
+  const [matches, setMatches] = useState([{ home: "", away: "" }]);
+  const [gridType, setGridType] = useState(15);
+  const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [result, setResult] = useState(null);
+  const [userGrid, setUserGrid] = useState([]);
+  const [history, setHistory] = useState(() => load(STORAGE_KEY, []));
+  const [competition, setCompetition] = useState(() => load(COMPETITION_KEY, { fred: 0, claude: 0, grilles: 0 }));
+  const [error, setError] = useState(null);
+  const [activeHistory, setActiveHistory] = useState(null);
+  const [photoOk, setPhotoOk] = useState(false);
+  const [grilles, setGrilles] = useState([]);
+  const [grillesLoading, setGrillesLoading] = useState(false);
+  const fileRef = useRef();
+
+  const handlePhoto = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const b64 = reader.result.split(",")[1];
+      const mediaType = file.type || "image/jpeg";
+      setLoading(true);
+      setLoadingMsg("Lecture de la grille...");
+      setError(null);
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 1000,
+            messages: [{ role: "user", content: [
+              { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
+              { type: "text", text: "Extrait la liste des matchs de cette grille Loto Foot. Réponds UNIQUEMENT en JSON pur : {\"gridType\": 15, \"matches\": [{\"home\": \"Equipe1\", \"away\": \"Equipe2\"}]}" }
+            ]}]
+          })
+        });
+        const data = await res.json();
+        const text = data.content?.find(b => b.type === "text")?.text || "";
+        const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+        setMatches(parsed.matches);
+        setGridType(parsed.gridType || 15);
+        setPhotoOk(true);
+      } catch {
+        setError("Impossible de lire la photo. Saisis manuellement.");
+      } finally {
+        setLoading(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const fetchGrilles = async () => {
+    setGrillesLoading(true);
+    setError(null);
+    try {
+      // Étape 1 : fetch la page Pronosoft
+      const pageRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 3000,
+          messages: [{ role: "user", content: "Fetche cette page et retourne son contenu brut : https://www.pronosoft.com/fr/lotofoot/systemes-lotofoot/" }],
+          tools: [{ type: "web_search_20250305", name: "web_search" }]
+        })
+      });
+      const pageData = await pageRes.json();
+      const pageText = pageData.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+
+      // Étape 2 : extraire les grilles du contenu
+      const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 2000,
+          system: "Tu extrais des données structurées. Tu réponds UNIQUEMENT en JSON valide, sans aucun texte avant ou après.",
+          messages: [{ role: "user", content: `Extrait toutes les grilles Loto Foot de ce contenu et retourne UNIQUEMENT ce JSON:
+{"grilles":[{"type":15,"numero":29,"deadline":"Sam 11 Avril 20h40","matches":[{"home":"Rennes","away":"Angers"}]}]}
+
+Contenu:
+${pageText.slice(0, 4000)}` }]
+        })
+      });
+      const extractData = await extractRes.json();
+      const jsonText = extractData.content?.find(b => b.type === "text")?.text || "";
+      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("Extraction échouée");
+      const parsed = JSON.parse(jsonMatch[0]);
+      setGrilles(parsed.grilles || []);
+      setScreen("grilles");
+    } catch (e) {
+      setError("Impossible de charger les grilles : " + e.message);
+    } finally {
+      setGrillesLoading(false);
+    }
+  };
+
+  const selectGrille = (g) => {
+    setMatches(g.matches);
+    setGridType(g.type);
+    setPhotoOk(false);
+    setError(null);
+    setScreen("input");
+  };
+
+  const goToProno = () => {
+    const valid = matches.filter(m => m.home.trim() && m.away.trim());
+    if (valid.length < Math.min(gridType, 7)) { setError("Minimum 7 matchs."); return; }
+    setUserGrid(valid.map(m => ({ match: `${m.home} vs ${m.away}`, pred: "" })));
+    setError(null);
+    setScreen("userprono");
+  };
+
+  const fetchFootballDB = async (matchList) => {
+    try {
+      // Step 1: get match URLs from programme page
+      const progRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          messages: [{ role: "user", content: `Fetch https://www.footballdatabase.eu/fr/programme et retourne UNIQUEMENT la liste des URLs de matchs trouvées au format /fr/match/resume/... pour ces matchs: ${matchList}. Retourne juste les URLs, une par ligne.` }]
+        })
+      });
+      const progData = await progRes.json();
+      const progText = progData.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+      
+      // Extract match URLs
+      const urlMatches = [...progText.matchAll(/\/fr\/match\/resume\/[\w-]+/g)].map(m => m[0]);
+      if (urlMatches.length === 0) return "";
+
+      // Step 2: fetch up to 4 match pages in parallel
+      const matchPages = await Promise.all(
+        urlMatches.slice(0, 4).map(async (url) => {
+          try {
+            const res = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 500,
+                tools: [{ type: "web_search_20250305", name: "web_search" }],
+                messages: [{ role: "user", content: `Fetch https://www.footballdatabase.eu${url} et extrait en 3 lignes max : 1) Arbitre et son bilan avec chaque équipe, 2) Forme récente des deux équipes (V/N/D), 3) Bilan H2H récent. Très concis.` }]
+              })
+            });
+            const data = await res.json();
+            return data.content?.filter(b => b.type === "text").map(b => b.text).join("").trim() || "";
+          } catch { return ""; }
+        })
+      );
+
+      const result = matchPages.filter(t => t).join("\n\n");
+      return result ? `\n\n--- FOOTBALLDATABASE (Forme, H2H, Arbitres) ---\n${result}\n---` : "";
+    } catch { return ""; }
+  };
+
+  const fetchPronosoft = async (matchList) => {
+    const ecartUrl = PRONOSOFT_URLS[gridType] || PRONOSOFT_URLS[15];
+    const pronoUrl = "https://www.pronosoft.com/fr/lotofoot/pronostics-lotofoot.htm";
+    const cyborgUrl = "https://www.pronosoft.com/fr/bookmakers/pronostics/";
+
+    const fetchPage = async (url, question) => {
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 600,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: "user", content: `${question} URL: ${url}` }]
+          })
+        });
+        const data = await res.json();
+        return data.content?.filter(b => b.type === "text").map(b => b.text).join("").trim() || "";
+      } catch { return ""; }
+    };
+
+    const [ecarts, pronos, cyborg] = await Promise.all([
+      fetchPage(ecartUrl, `Extrait les écarts courants (1/N/2 par position) et séries en cours pour LF${gridType}. Texte court.`),
+      fetchPage(pronoUrl, `Pour ces matchs: ${matchList}, extrait la musique récente (G/P/N) de chaque équipe visible sur la page. Texte court.`),
+      fetchPage(cyborgUrl, `Pour ces matchs: ${matchList}, extrait les pronostics Cyborg (1/N/2) disponibles. Texte court.`)
+    ]);
+
+    let ctx = "";
+    if (ecarts) ctx += `\n\n--- MUSIQUE DE GRILLE LF${gridType} (Pronosoft) ---\n${ecarts}`;
+    if (pronos) ctx += `\n\n--- MUSIQUE INDIVIDUELLE DES ÉQUIPES ---\n${pronos}`;
+    if (cyborg) ctx += `\n\n--- PRONOSTICS CYBORG ---\n${cyborg}`;
+    return ctx;
+  };
+
+  const analyze = async () => {
+    const valid = matches.filter(m => m.home.trim() && m.away.trim());
+    setLoading(true);
+    setError(null);
+
+    setLoadingMsg("Récupération stats (Pronosoft + FootballDB)...");
+    const matchList = valid.map((m, i) => `${i+1}. ${m.home} vs ${m.away}`).join(', ');
+    const [pronosoftCtx, footballdbCtx] = await Promise.all([
+      fetchPronosoft(matchList),
+      fetchFootballDB(matchList)
+    ]);
+
+    setLoadingMsg("Analyse en cours...");
+    const t = setTimeout(() => setLoadingMsg("Calcul des surprises..."), 2500);
+
+    const hist = load(STORAGE_KEY, []);
+    const histCtx = hist.length > 0
+      ? `\n\nHistorique récent :\n${hist.slice(-5).map(h =>
+          `${h.date}: ${h.matches.map(m =>
+            `${m.match} prédit:${m.aiPred} réel:${m.real || "?"} ${m.real ? (m.real === m.aiPred ? "✓" : "✗") : ""}`
+          ).join(", ")}`
+        ).join("\n")}` : "";
+
+    const prompt = `Grille Loto Foot ${valid.length} matchs :\n${valid.map((m, i) => `${i + 1}. ${m.home} vs ${m.away}`).join("\n")}${pronosoftCtx}${footballdbCtx}${histCtx}`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 4000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+      const data = await res.json();
+      const text = data.content?.find(b => b.type === "text")?.text || "";
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      setResult(parsed);
+      setUserGrid(prev => parsed.matches.map((m, i) => ({ match: m.match, pred: prev[i]?.pred || "" })));
+      setScreen("result");
+    } catch (e) {
+      setError("Erreur : " + (e.message || "réessaie."));
+    } finally {
+      clearTimeout(t);
+      setLoading(false);
+    }
+  };
+
+  const saveResult = () => {
+    if (!result) return;
+    const entry = {
+      id: Date.now(),
+      date: new Date().toLocaleDateString("fr-FR"),
+      gridType,
+      matches: result.matches.map((m, i) => ({
+        match: m.match,
+        aiPred: m.prediction,
+        fredPred: userGrid[i]?.pred || "",
+        real: null,
+        double: m.double,
+        triple: m.triple,
+        risk: m.risk,
+      })),
+      conseil: result.conseil_global,
+      surprises: result.surprises_potentielles || [],
+      scored: false,
+    };
+    const updated = [...history, entry];
+    setHistory(updated);
+    save(STORAGE_KEY, updated);
+    const newComp = { ...competition, grilles: competition.grilles + 1 };
+    setCompetition(newComp);
+    save(COMPETITION_KEY, newComp);
+    setScreen("home");
+  };
+
+  const updateReal = (hi, mi, val) => {
+    const updated = [...history];
+    updated[hi].matches[mi].real = val;
+    const h = updated[hi];
+    if (!h.scored && h.matches.every(m => m.real)) {
+      const fredScore = h.matches.filter(m => m.fredPred && m.real === m.fredPred).length;
+      const aiScore = h.matches.filter(m => m.aiPred && m.real === m.aiPred).length;
+      const newComp = { ...competition, fred: competition.fred + fredScore, claude: competition.claude + aiScore };
+      updated[hi].scored = true;
+      setCompetition(newComp);
+      save(COMPETITION_KEY, newComp);
+    }
+    setHistory(updated);
+    save(STORAGE_KEY, updated);
+  };
+
+  if (screen === "home") return (
+    <div style={S.page}>
+      <div style={S.hero}>
+        <div style={S.badge}>⚽ LOTO FOOT IA</div>
+        <h1 style={S.title}>Prédicteur<br />v3</h1>
+        <p style={S.sub}>Musique • Pronosoft • Compétition</p>
+      </div>
+      <div style={S.compet}>
+        <div style={S.competTitle}>🏆 COMPÉTITION</div>
+        <div style={S.competRow}>
+          <div style={S.competBox}>
+            <span style={S.competName}>FRED</span>
+            <span style={{ ...S.competScore, color: "#4ade80" }}>{competition.fred}</span>
+          </div>
+          <div style={S.competVs}>VS</div>
+          <div style={S.competBox}>
+            <span style={S.competName}>CLAUDE</span>
+            <span style={{ ...S.competScore, color: "#60a5fa" }}>{competition.claude}</span>
+          </div>
+        </div>
+        <div style={S.competSub}>{competition.grilles} grille{competition.grilles !== 1 ? "s" : ""} jouée{competition.grilles !== 1 ? "s" : ""}</div>
+      </div>
+      <div style={S.cards}>
+        <button style={S.cardBtn} onClick={() => { setMatches([{ home: "", away: "" }]); setPhotoOk(false); setError(null); setScreen("input"); }}>
+          <span style={S.cardIcon}>📋</span>
+          <span style={S.cardLabel}>Nouvelle grille</span>
+        </button>
+        <button style={S.cardBtn} onClick={() => setScreen("history")}>
+          <span style={S.cardIcon}>📊</span>
+          <span style={S.cardLabel}>Historique</span>
+          {history.length > 0 && <span style={S.badgeNum}>{history.length}</span>}
+        </button>
+      </div>
+      <button style={{ ...S.analyzeBtn, background: "#1e1e3a", color: "#facc15", border: "1px solid #facc15", margin: "0 16px" }}
+        onClick={fetchGrilles} disabled={grillesLoading}>
+        {grillesLoading ? "⏳ Chargement..." : "📡 Grilles ouvertes Pronosoft"}
+      </button>
+      {error && <p style={S.error}>{error}</p>}
+    </div>
+  );
+
+  if (screen === "grilles") return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <button style={S.back} onClick={() => setScreen("home")}>←</button>
+        <h2 style={S.headerTitle}>Grilles ouvertes</h2>
+      </div>
+      {grilles.length === 0 && <p style={S.empty}>Aucune grille trouvée.</p>}
+      {grilles.map((g, i) => (
+        <div key={i} style={{ ...S.histCard, cursor: "pointer" }} onClick={() => selectGrille(g)}>
+          <div style={S.histHeader}>
+            <span style={{ ...S.badge, fontSize: 11 }}>LF{g.type} n°{g.numero}</span>
+            <span style={{ flex: 1, marginLeft: 8, fontSize: 12, color: "#666688", fontFamily: "monospace" }}>⏰ {g.deadline}</span>
+            <span style={{ color: "#facc15", fontFamily: "monospace", fontSize: 12 }}>→</span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+            {g.matches.map((m, mi) => (
+              <span key={mi} style={{ fontSize: 10, color: "#ccccee", fontFamily: "monospace", background: "#0a0a14", padding: "2px 6px", borderRadius: 4 }}>
+                {mi + 1}. {m.home} - {m.away}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  if (screen === "input") return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <button style={S.back} onClick={() => setScreen("home")}>←</button>
+        <h2 style={S.headerTitle}>Saisie grille</h2>
+      </div>
+      <div style={S.toggleRow}>
+        {[7, 8, 12, 15].map(n => (
+          <button key={n} style={{ ...S.toggle, ...(gridType === n ? S.toggleActive : {}) }} onClick={() => setGridType(n)}>LF{n}</button>
+        ))}
+      </div>
+      <div style={S.photoSection}>
+        <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhoto} />
+        <button style={S.photoBtn} onClick={() => fileRef.current.click()} disabled={loading}>
+          {loading ? loadingMsg : "📷 Importer une photo de la grille"}
+        </button>
+        {photoOk && <p style={S.photoOk}>✓ Grille lue — vérifie les matchs</p>}
+      </div>
+      <div style={S.matchList}>
+        {matches.map((m, i) => (
+          <div key={i} style={S.matchRow}>
+            <span style={S.matchNum}>{i + 1}</span>
+            <input style={S.input} placeholder="Domicile" value={m.home}
+              onChange={e => { const u = [...matches]; u[i] = { ...u[i], home: e.target.value }; setMatches(u); }} />
+            <span style={S.vs}>-</span>
+            <input style={S.input} placeholder="Extérieur" value={m.away}
+              onChange={e => { const u = [...matches]; u[i] = { ...u[i], away: e.target.value }; setMatches(u); }} />
+            {matches.length > 1 && <button style={S.del} onClick={() => setMatches(matches.filter((_, j) => j !== i))}>✕</button>}
+          </div>
+        ))}
+      </div>
+      {matches.length < gridType && (
+        <button style={S.addBtn} onClick={() => setMatches([...matches, { home: "", away: "" }])}>+ Ajouter</button>
+      )}
+      {error && <p style={S.error}>{error}</p>}
+      <button style={S.analyzeBtn} onClick={goToProno}>
+        Mes pronos → ({matches.filter(m => m.home && m.away).length}/{gridType})
+      </button>
+    </div>
+  );
+
+  if (screen === "userprono") return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <button style={S.back} onClick={() => setScreen("input")}>←</button>
+        <h2 style={S.headerTitle}>Tes pronostics</h2>
+      </div>
+      <p style={{ padding: "10px 16px 4px", fontSize: 12, color: "#facc15", fontFamily: "monospace" }}>
+        Saisis tes pronos — tu ne vois pas encore les miens
+      </p>
+      <div style={S.matchList}>
+        {userGrid.map((m, i) => (
+          <div key={i} style={{ ...S.matchRow, padding: "10px" }}>
+            <span style={S.matchNum}>{i + 1}</span>
+            <span style={{ flex: 1, fontSize: 13, color: "#f0f0f0" }}>{m.match}</span>
+            <div style={S.fredBtns}>
+              {["1", "N", "2"].map(v => (
+                <button key={v}
+                  style={{ ...S.fredBtn, ...(m.pred === v ? { background: PC[v], color: "#0a0a14" } : {}) }}
+                  onClick={() => { const u = [...userGrid]; u[i] = { ...u[i], pred: v }; setUserGrid(u); }}>
+                  {v}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && <p style={S.error}>{error}</p>}
+      <button style={S.analyzeBtn} onClick={analyze} disabled={loading}>
+        {loading ? `⏳ ${loadingMsg}` : `⚡ Lancer l'analyse IA (${userGrid.filter(m => m.pred).length}/${userGrid.length})`}
+      </button>
+    </div>
+  );
+
+  if (screen === "result" && result) return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <button style={S.back} onClick={() => setScreen("userprono")}>←</button>
+        <h2 style={S.headerTitle}>Comparaison</h2>
+      </div>
+      <div style={S.distRow}>
+        {Object.entries(result.distribution || {}).map(([k, v]) => (
+          <div key={k} style={{ ...S.distBox, borderColor: PC[k] || "#1e1e3a" }}>
+            <span style={{ ...S.distKey, color: PC[k] }}>{k}</span>
+            <span style={S.distVal}>{v}</span>
+          </div>
+        ))}
+      </div>
+      {result.surprises_potentielles?.length > 0 && (
+        <div style={S.surprises}>
+          <div style={S.surprisesTitle}>⚠️ SURPRISES POTENTIELLES</div>
+          {result.surprises_potentielles.map((s, i) => <div key={i} style={S.surpriseItem}>• {s}</div>)}
+        </div>
+      )}
+      {result.conseil_global && <div style={S.conseil}>{result.conseil_global}</div>}
+      <div style={{ display: "flex", padding: "4px 16px 2px", gap: 6 }}>
+        <span style={{ minWidth: 20, fontSize: 10, color: "#44445a", fontFamily: "monospace" }}>#</span>
+        <span style={{ flex: 1, fontSize: 10, color: "#44445a", fontFamily: "monospace" }}>Match</span>
+        <span style={{ width: 36, textAlign: "center", fontSize: 10, color: "#60a5fa", fontFamily: "monospace" }}>IA</span>
+        <span style={{ width: 36, textAlign: "center", fontSize: 10, color: "#4ade80", fontFamily: "monospace" }}>Toi</span>
+      </div>
+      <div style={S.matchList}>
+        {result.matches?.map((m, i) => {
+          const accord = userGrid[i]?.pred === m.prediction;
+          return (
+            <div key={i} style={{ ...S.resultCard, borderColor: accord ? "#2a3a2a" : "#1e1e3a" }}>
+              <div style={S.resultTop}>
+                <span style={S.resultNum}>{i + 1}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span style={S.resultMatch}>{m.match}</span>
+                  <div style={S.resultMeta}>
+                    <span style={{ ...S.riskTag, background: RC[m.risk] || "#facc15" }}>{m.risk}</span>
+                    {m.double && <span style={S.tag}>DBL</span>}
+                    {m.triple && <span style={S.tag}>TPL</span>}
+                    {accord && <span style={{ ...S.tag, color: "#4ade80" }}>✓</span>}
+                  </div>
+                </div>
+                <span style={{ ...S.predBadge, background: PC[m.prediction] }}>{m.prediction}</span>
+                <span style={{ ...S.predBadge, background: userGrid[i]?.pred ? PC[userGrid[i].pred] : "#1e1e3a", color: userGrid[i]?.pred ? "#0a0a14" : "#444" }}>
+                  {userGrid[i]?.pred || "?"}
+                </span>
+              </div>
+              <p style={S.reason}>{m.reason}</p>
+            </div>
+          );
+        })}
+      </div>
+      <button style={S.saveBtn} onClick={saveResult}>💾 Sauvegarder</button>
+    </div>
+  );
+
+  if (screen === "history") return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <button style={S.back} onClick={() => setScreen("home")}>←</button>
+        <h2 style={S.headerTitle}>Historique</h2>
+      </div>
+      {history.length === 0 && <p style={S.empty}>Aucune grille sauvegardée.</p>}
+      {[...history].reverse().map((h, ri) => {
+        const hi = history.length - 1 - ri;
+        const played = h.matches.filter(m => m.real).length;
+        const aiOk = h.matches.filter(m => m.real && m.real === m.aiPred).length;
+        const fredOk = h.matches.filter(m => m.real && m.fredPred && m.real === m.fredPred).length;
+        return (
+          <div key={h.id} style={S.histCard}>
+            <div style={S.histHeader}>
+              <span style={S.histDate}>LF{h.gridType} — {h.date}</span>
+              <span style={S.histScores}>
+                Fred <span style={{ color: "#4ade80" }}>{fredOk}</span>
+                {" · "}IA <span style={{ color: "#60a5fa" }}>{aiOk}</span>
+                <span style={{ color: "#44445a" }}> /{played}</span>
+              </span>
+              <button style={S.delBtn} onClick={() => { const u = history.filter(x => x.id !== h.id); setHistory(u); save(STORAGE_KEY, u); }}>🗑</button>
+            </div>
+            <button style={S.expandBtn} onClick={() => setActiveHistory(activeHistory === h.id ? null : h.id)}>
+              {activeHistory === h.id ? "Masquer" : `Résultats (${played}/${h.matches.length})`}
+            </button>
+            {activeHistory === h.id && h.matches.map((m, mi) => (
+              <div key={mi} style={S.histMatch}>
+                <span style={S.histMatchName}>{m.match}</span>
+                <span style={{ ...S.predBadge, background: PC[m.aiPred], fontSize: 10, padding: "2px 6px" }}>{m.aiPred}</span>
+                {m.fredPred && <span style={{ ...S.predBadge, background: "#1e1e3a", fontSize: 10, padding: "2px 6px", color: PC[m.fredPred] || "#fff" }}>{m.fredPred}</span>}
+                <div style={S.realBtns}>
+                  {["1", "N", "2"].map(v => (
+                    <button key={v} style={{
+                      ...S.realBtn,
+                      ...(m.real === v ? {
+                        background: v === m.aiPred && v === m.fredPred ? "#4ade80"
+                          : v === m.aiPred ? "#60a5fa"
+                          : v === m.fredPred ? "#a78bfa"
+                          : "#f87171",
+                        color: "#0a0a14", border: "1px solid transparent"
+                      } : {})
+                    }} onClick={() => updateReal(hi, mi, v)}>{v}</button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  return null;
+}
+
+const S = {
+  page: { minHeight: "100vh", background: "#0a0a14", color: "#f0f0f0", fontFamily: "'Georgia', serif", paddingBottom: 40, maxWidth: 480, margin: "0 auto" },
+  hero: { background: "linear-gradient(135deg, #12122a 0%, #0a0a14 100%)", padding: "40px 20px 24px", borderBottom: "1px solid #1e1e3a" },
+  badge: { display: "inline-block", background: "#facc15", color: "#0a0a14", fontFamily: "monospace", fontWeight: "bold", fontSize: 10, padding: "3px 10px", borderRadius: 2, marginBottom: 12, letterSpacing: 2 },
+  title: { fontSize: 36, fontWeight: "bold", margin: "0 0 6px", lineHeight: 1.1 },
+  sub: { color: "#666688", fontSize: 12, margin: 0, letterSpacing: 1 },
+  compet: { margin: "16px", background: "#12122a", border: "1px solid #1e1e3a", borderRadius: 12, padding: "14px" },
+  competTitle: { fontSize: 10, fontFamily: "monospace", color: "#facc15", letterSpacing: 2, marginBottom: 10 },
+  competRow: { display: "flex", alignItems: "center", gap: 12 },
+  competBox: { flex: 1, textAlign: "center" },
+  competName: { display: "block", fontSize: 11, fontFamily: "monospace", color: "#666688", marginBottom: 4 },
+  competScore: { fontSize: 32, fontWeight: "bold" },
+  competVs: { color: "#2a2a4a", fontFamily: "monospace", fontWeight: "bold" },
+  competSub: { textAlign: "center", color: "#44445a", fontSize: 11, fontFamily: "monospace", marginTop: 8 },
+  cards: { display: "flex", gap: 10, padding: "12px 16px" },
+  cardBtn: { flex: 1, background: "#12122a", border: "1px solid #1e1e3a", borderRadius: 12, padding: "18px 10px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, position: "relative", color: "#f0f0f0" },
+  cardIcon: { fontSize: 26 },
+  cardLabel: { fontSize: 12, fontFamily: "monospace", letterSpacing: 1 },
+  badgeNum: { position: "absolute", top: 8, right: 8, background: "#facc15", color: "#0a0a14", borderRadius: "50%", width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: "bold" },
+  header: { display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderBottom: "1px solid #1e1e3a", position: "sticky", top: 0, background: "#0a0a14", zIndex: 10 },
+  back: { background: "none", border: "1px solid #1e1e3a", color: "#f0f0f0", borderRadius: 8, padding: "5px 10px", cursor: "pointer", fontSize: 16 },
+  headerTitle: { margin: 0, fontSize: 16, fontWeight: "bold" },
+  toggleRow: { display: "flex", gap: 6, padding: "12px 16px 0" },
+  toggle: { flex: 1, padding: "8px 4px", background: "#12122a", border: "1px solid #1e1e3a", borderRadius: 8, color: "#666688", cursor: "pointer", fontFamily: "monospace", fontSize: 12 },
+  toggleActive: { background: "#facc15", color: "#0a0a14", border: "1px solid #facc15", fontWeight: "bold" },
+  photoSection: { padding: "12px 16px" },
+  photoBtn: { width: "100%", background: "#12122a", border: "1px dashed #facc15", color: "#facc15", borderRadius: 10, padding: "12px", cursor: "pointer", fontFamily: "monospace", fontSize: 13 },
+  photoOk: { color: "#4ade80", fontFamily: "monospace", fontSize: 12, margin: "6px 0 0" },
+  matchList: { padding: "8px 16px", display: "flex", flexDirection: "column", gap: 6 },
+  matchRow: { display: "flex", alignItems: "center", gap: 6, background: "#12122a", padding: "7px 10px", borderRadius: 10, border: "1px solid #1e1e3a" },
+  matchNum: { color: "#facc15", fontFamily: "monospace", fontWeight: "bold", fontSize: 11, minWidth: 18 },
+  input: { flex: 1, background: "transparent", border: "none", color: "#f0f0f0", fontSize: 13, outline: "none", fontFamily: "Georgia, serif", minWidth: 0 },
+  vs: { color: "#2a2a4a", fontWeight: "bold" },
+  del: { background: "none", border: "none", color: "#f87171", cursor: "pointer", fontSize: 12 },
+  addBtn: { margin: "6px 16px", background: "none", border: "1px dashed #1e1e3a", color: "#666688", borderRadius: 8, padding: "8px", cursor: "pointer", width: "calc(100% - 32px)", fontFamily: "monospace", fontSize: 12 },
+  analyzeBtn: { margin: "12px 16px 0", background: "#facc15", border: "none", color: "#0a0a14", borderRadius: 10, padding: "15px", cursor: "pointer", width: "calc(100% - 32px)", fontWeight: "bold", fontSize: 14, fontFamily: "monospace", letterSpacing: 1 },
+  error: { color: "#f87171", padding: "6px 16px", fontSize: 12, fontFamily: "monospace" },
+  distRow: { display: "flex", justifyContent: "center", gap: 10, padding: "14px 16px 8px" },
+  distBox: { background: "#12122a", border: "1px solid", borderRadius: 10, padding: "10px 18px", textAlign: "center" },
+  distKey: { display: "block", fontFamily: "monospace", fontWeight: "bold", fontSize: 20 },
+  distVal: { display: "block", color: "#666688", fontSize: 12, fontFamily: "monospace" },
+  surprises: { margin: "0 16px 10px", background: "#1a1209", border: "1px solid #f87171", borderRadius: 10, padding: "10px 12px" },
+  surprisesTitle: { fontSize: 10, fontFamily: "monospace", color: "#f87171", letterSpacing: 2, marginBottom: 6 },
+  surpriseItem: { fontSize: 12, color: "#ffaa88", lineHeight: 1.5 },
+  conseil: { margin: "0 16px 10px", background: "#12122a", border: "1px solid #1e1e3a", borderRadius: 10, padding: "10px 12px", fontSize: 12, color: "#ccccee", fontStyle: "italic", lineHeight: 1.5 },
+  resultCard: { background: "#12122a", border: "1px solid", borderRadius: 10, padding: "10px", marginBottom: 6 },
+  resultTop: { display: "flex", alignItems: "center", gap: 6, marginBottom: 4 },
+  resultNum: { color: "#facc15", fontFamily: "monospace", fontWeight: "bold", fontSize: 11, minWidth: 20 },
+  resultMatch: { fontSize: 12, fontWeight: "bold", color: "#ffffff", display: "block", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  resultMeta: { display: "flex", gap: 4, marginTop: 3, flexWrap: "wrap" },
+  riskTag: { fontSize: 9, fontFamily: "monospace", fontWeight: "bold", padding: "1px 5px", borderRadius: 3, color: "#0a0a14" },
+  tag: { background: "#1e1e3a", color: "#facc15", fontSize: 9, fontFamily: "monospace", fontWeight: "bold", padding: "1px 5px", borderRadius: 3, letterSpacing: 1 },
+  predBadge: { borderRadius: 6, padding: "4px 8px", fontFamily: "monospace", fontWeight: "bold", fontSize: 13, color: "#0a0a14", minWidth: 32, textAlign: "center" },
+  fredBtns: { display: "flex", gap: 4 },
+  fredBtn: { background: "#0a0a14", border: "1px solid #1e1e3a", color: "#f0f0f0", borderRadius: 5, padding: "5px 9px", cursor: "pointer", fontFamily: "monospace", fontSize: 13, fontWeight: "bold" },
+  reason: { fontSize: 11, color: "#666688", margin: 0, lineHeight: 1.4 },
+  saveBtn: { margin: "14px 16px 0", background: "#12122a", border: "1px solid #facc15", color: "#facc15", borderRadius: 10, padding: "13px", cursor: "pointer", width: "calc(100% - 32px)", fontFamily: "monospace", fontSize: 13, fontWeight: "bold" },
+  histCard: { margin: "0 16px 10px", background: "#12122a", border: "1px solid #1e1e3a", borderRadius: 10, padding: "12px" },
+  histHeader: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  histDate: { flex: 1, fontSize: 12, fontFamily: "monospace", color: "#ccccee" },
+  histScores: { fontSize: 12, fontFamily: "monospace" },
+  delBtn: { background: "none", border: "none", cursor: "pointer", fontSize: 13 },
+  expandBtn: { background: "none", border: "1px solid #1e1e3a", color: "#666688", borderRadius: 6, padding: "5px 10px", cursor: "pointer", fontFamily: "monospace", fontSize: 11, width: "100%", marginBottom: 6 },
+  histMatch: { display: "flex", alignItems: "center", gap: 5, padding: "5px 0", borderTop: "1px solid #1e1e3a" },
+  histMatchName: { flex: 1, fontSize: 11, color: "#ccccee", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  realBtns: { display: "flex", gap: 3 },
+  realBtn: { background: "#0a0a14", border: "1px solid #1e1e3a", color: "#f0f0f0", borderRadius: 4, padding: "3px 7px", cursor: "pointer", fontFamily: "monospace", fontSize: 11, fontWeight: "bold" },
+  empty: { textAlign: "center", color: "#2a2a4a", fontFamily: "monospace", padding: "40px 16px" },
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js');
+  });
+}
+  </script>
+</body>
+</html>
